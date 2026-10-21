@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 
-class ConvLayer(nn.Module):
+class ConvLayer(nn.Module):                                 #親クラスnnModuleの能力を引き継いだ新しい子クラスConvLayerを作るよ。
     """
     Convolutional operation on graphs
     """
@@ -20,7 +20,7 @@ class ConvLayer(nn.Module):
         nbr_fea_len: int
           Number of bond features.
         """
-        super(ConvLayer, self).__init__()
+       super(ConvLayer, self).__init__()     #ConvLayer の親である nn.Module を探し出し、その __init__ を現在の self に向けて実行する
         self.atom_fea_len = atom_fea_len
         self.nbr_fea_len = nbr_fea_len
         self.fc_full = nn.Linear(2*self.atom_fea_len+self.nbr_fea_len,
@@ -103,7 +103,7 @@ class CrystalGraphConvNet(nn.Module):
         """
         super(CrystalGraphConvNet, self).__init__()
         self.classification = classification
-        self.embedding = nn.Linear(orig_atom_fea_len, atom_fea_len)
+        self.embedding = nn.Linear(orig_atom_fea_len, atom_fea_len)         #nn.LinearはPytorchの線形変換。
         self.convs = nn.ModuleList([ConvLayer(atom_fea_len=atom_fea_len,
                                     nbr_fea_len=nbr_fea_len)
                                     for _ in range(n_conv)])

@@ -98,7 +98,7 @@ class CGConvNet(nn.Module):
     """
     Crystal Graph Convolutional Neural Network
     """
-    def __init__(self, orig_D_v, D_u, D_v=64, t_conv=3, hidden_fea_llen=128, L_hidden=1, out_dim=1, classification=False, version='v5'):   # out_dim: target dimension or num classes
+    def __init__(self, orig_D_v, D_u, D_v=64, t_conv=3, hidden_fea_len=128, L_hidden=1, out_dim=1, classification=False, version='v5'):   # out_dim: target dimension or num classes
         super(CGConvNet, self).__init__()
         self.version = version
         self.L_hidden = L_hidden
@@ -116,12 +116,12 @@ class CGConvNet(nn.Module):
                 self.convs.append(CGConv_v5(D_v, D_u))
 
         # 3. MLP layers after Pooling
-        self.conv_to_fc = nn.Linear(D_v, hidden_fea_llen)      # Entry layer: D_v -> hidden_fea_llen
+        self.conv_to_fc = nn.Linear(D_v, hidden_fea_len)      # Entry layer: D_v -> hidden_fea_len
         # Multiple hidden layers if L_hidden > 1
         if self.L_hidden > 1:
-            self.fcs = nn.ModuleList([nn.Linear(hidden_fea_llen, hidden_fea_llen) for _ in range(self.L_hidden - 1)])
-        # Output layer: hidden_fea_llen -> out_dim (B x out_dim)
-        self.fc_out = nn.Linear(hidden_fea_llen, out_dim)               # If classification=True, out_dim usually represents the number of classes (e.g., 2)
+            self.fcs = nn.ModuleList([nn.Linear(hidden_fea_len, hidden_fea_len) for _ in range(self.L_hidden - 1)])
+        # Output layer: hidden_fea_len -> out_dim (B x out_dim)
+        self.fc_out = nn.Linear(hidden_fea_len, out_dim)               # If classification=True, out_dim usually represents the number of classes (e.g., 2)
         
         self.softplus = nn.Softplus()
 
@@ -141,7 +141,7 @@ class CGConvNet(nn.Module):
         v_c_fea = torch.cat(v_c_fea_list, dim=0)                # Shape: B x D_v
         
         # Step 4: MLP layers for prediction
-        v_c_fea = self.softplus(self.conv_to_fc(v_c_fea))     # Shape: B x hidden_fea_llen
+        v_c_fea = self.softplus(self.conv_to_fc(v_c_fea))     # Shape: B x hidden_fea_len
         
         if self.L_hidden > 1:
             for fc in self.fcs:
@@ -150,3 +150,51 @@ class CGConvNet(nn.Module):
         out = self.fc_out(v_c_fea)                             # Shape: B x out_dim
             
         return out
+
+"""
+ダミー
+"""
+if __name__ == "__main__":
+
+   # 1. ハイパーパラメータの設定
+    orig_atom_fea_len = 92  # atom_init.jsonの次元数
+    nbr_fea_len = 41        # ガウシアン展開された距離特徴量の次元数
+    atom_fea_len = 64       # 隠れ層の原子特徴量次元
+    h_fea_len = 128         # MLP隠れ層の次元
+    n_conv = 3              # CGConv層の数
+    out_dim = 1             # 予測対象次元
+
+    # 2. モデルのインスタンス化
+    model = CGConvNet(
+        orig_D_v=orig_atom_fea_len,
+        D_u=nbr_fea_len,
+        D_v=atom_fea_len,
+        t_conv=n_conv,
+        hidden_fea_len=h_fea_len,
+        out_dim=out_dim,
+        version='v5'
+    )
+
+    # 3. ダミーデータの作成（エッジリスト形式）
+    # 2つの結晶バッチ（合計5原子: 結晶0は原子0,1,2 / 結晶1は原子3,4）
+    N_total = 5   # 全原子数
+    E_total = 12  # 全エッジ数（例: 全原子から伸びている合計ボンド数）
+
+    atom_fea = torch.randn(N_total, orig_atom_fea_len) # Shape: (5, 92)
+    u_fea = torch.randn(E_total, nbr_fea_len)          # Shape: (12, 41)
+    
+    # edge_idx は Shape: (2, 12)
+    # 1行目: 受け手原子(i), 2行目: 送り手原子(j)
+    edge_idx = torch.randint(0, N_total, (2, E_total))
+    
+    # 結晶ごとの原子割り当てインデックス
+    crystal_atom_idx = [torch.tensor([0, 1, 2]), torch.tensor([3, 4])]
+
+    # 4. forwardの実行テスト
+    try:
+        out = model(atom_fea, u_fea, edge_idx, crystal_atom_idx)
+        print("動作確認成功！")
+        print(f"出力テンソルの Shape: {out.shape}")  # torch.Size([2, 1]) になれば正常です
+    except Exception as e:
+        print("エラーが発生しました:")
+        print(e)
