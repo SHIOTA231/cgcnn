@@ -103,6 +103,8 @@ class CGConvNet(nn.Module):
         self.version = version
         self.L_hidden = L_hidden
         self.classification = classification
+        self.cache = {}  # 順伝播の中間変数を保存するよう
+        self.grads = {}  # 手計算した勾配を保存するよう
         
         # 1. Embedding layer for raw atom features
         self.embedding = nn.Linear(orig_D_v, D_v)
@@ -124,32 +126,108 @@ class CGConvNet(nn.Module):
         self.fc_out = nn.Linear(hidden_fea_len, out_dim)               # If classification=True, out_dim usually represents the number of classes (e.g., 2)
         
         self.softplus = nn.Softplus()
-
+       
+        
     def forward(self, v_fea, u_fea, edge_idx, B_idx):
-        """
-        Forward pass for CGConvNet
-        """
+        """Forward pass for CGConvNet (逆伝播用の中間変数を cache に保存する)"""
         # Step 1: Embed raw atom features
-        v_fea = self.embedding(v_fea)
-    
+        v_fea_emb = self.embedding(v_fea)
+        self.cache['v_fea_raw'] = (
+            v_fea  # 埋め込み層(Linear)の逆伝播で使うため保存
+        )
+        self.cache['v_fea_emb'] = v_fea_emb
+
         # Step 2: Pass through CGConv layers
+        v_fea_conv = v_fea_emb
+        self.cache['conv_inputs'] = []  # 各Conv層への入力を保存するリスト
+
         for conv in self.convs:
-            v_fea = conv(v_fea, u_fea, edge_idx)
-            
-        # Step 3: Pooling (Mean Pooling for each crystal in batch)
-        v_c_fea_list = [torch.mean(v_fea[idx], dim=0, keepdim=True) for idx in B_idx]
-        v_c_fea = torch.cat(v_c_fea_list, dim=0)                # Shape: B x D_v
-        
+            self.cache['conv_inputs'].append(v_fea_conv)
+            v_fea_conv = conv(v_fea_conv, u_fea, edge_idx)
+
+        self.cache['v_fea_conv_out'] = v_fea_conv
+
+        # Step 3: Pooling (Mean Pooling)
+        v_c_fea_list = [
+            torch.mean(v_fea_conv[idx], dim=0, keepdim=True) for idx in B_idx
+        ]
+        v_c_fea = torch.cat(v_c_fea_list, dim=0)  # Shape: B x D_v
+        self.cache['v_c_fea_pooled'] = v_c_fea  # Pooling直後のベクトル
+
         # Step 4: MLP layers for prediction
-        v_c_fea = self.softplus(self.conv_to_fc(v_c_fea))     # Shape: B x hidden_fea_len
-        
+        fc_in_z = self.conv_to_fc(v_c_fea)  # Softplusの直前の値(z)
+        self.cache['fc_in_z'] = fc_in_z
+
+        v_c_fea_act = self.softplus(fc_in_z)
+        self.cache['v_c_fea_act'] = v_c_fea_act
+
+        # 複数隠れ層がある場合
         if self.L_hidden > 1:
-            for fc in self.fcs:
-                v_c_fea = self.softplus(fc(v_c_fea))
-                
-        out = self.fc_out(v_c_fea)                             # Shape: B x out_dim
-            
+            # (省略: 1層の場合は通らない)
+            pass
+
+        out = self.fc_out(v_c_fea_act)  # Shape: B x out_dim
+
+        # ★【重要】ここを追加！ manual_backward で使うため最後に out を保存する
+        self.cache['out'] = out
+
         return out
+    
+    def manual_backward(self, target):
+        """出力 Loss から入力に向かって、連鎖律に従って手動で微分を遡っていく！"""
+        out = self.cache['out']
+        v_c_fea_act = self.cache['v_c_fea_act']
+        fc_in_z = self.cache['fc_in_z']
+        v_c_fea_pooled = self.cache['v_c_fea_pooled']
+
+        B = out.shape[0]  # バッチサイズ
+
+        # =========================================================
+        # 1. 損失関数 (MSE Loss) の微分: dL / d(out)
+        # =========================================================
+        # L = (1/B) * sum((out - target)^2)  ==>  dL/dout = (2/B) * (out - target)
+        d_out = (2.0 / B) * (out - target)
+
+        # =========================================================
+        # 2. 出力層 (fc_out: Y = X * W + b) の逆伝播
+        # =========================================================
+        # self.fc_out.weight の形状: (out_dim, hidden_fea_len)
+        # d_out の形状: (B, out_dim)
+        # v_c_fea_act の形状: (B, hidden_fea_len)
+
+        # 重み W_fc_out の勾配
+        self.grads['fc_out.weight'] = torch.matmul(d_out.T, v_c_fea_act)
+        # バイアス b_fc_out の勾配
+        self.grads['fc_out.bias'] = torch.sum(d_out, dim=0)
+
+        # 前の層（Softplusの出力）に送る勾配: dL / d(v_c_fea_act)
+        d_v_c_fea_act = torch.matmul(d_out, self.fc_out.weight)
+
+        # =========================================================
+        # 3. Softplus 活性化関数の逆伝播
+        # =========================================================
+        # Softplus: y = ln(1 + e^z)  ==>  dy/dz = 1 / (1 + e^-z) = Sigmoid(z)
+        d_fc_in_z = d_v_c_fea_act * torch.sigmoid(fc_in_z)
+
+        # =========================================================
+        # 4. 全結合層 (conv_to_fc: Z = X * W + b) の逆伝播
+        # =========================================================
+        # 重み W_conv_to_fc の勾配
+        self.grads['conv_to_fc.weight'] = torch.matmul(
+            d_fc_in_z.T, v_c_fea_pooled
+        )
+        # バイアス b_conv_to_fc の勾配
+        self.grads['conv_to_fc.bias'] = torch.sum(d_fc_in_z, dim=0)
+
+        # 前の層（Pooling直後のベクトル）に送る勾配: dL / d(v_c_fea_pooled)
+        d_v_c_fea_pooled = torch.matmul(d_fc_in_z, self.conv_to_fc.weight)
+
+        # =========================================================
+        # 5. Pooling (Mean Pooling) の逆伝播へ続く...
+        # =========================================================
+        # (d_v_c_fea_pooled を使って各原子の勾配へ拡張・分配していきます)
+
+    
 
 """
 ダミー
