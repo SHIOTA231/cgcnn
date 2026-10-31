@@ -70,6 +70,9 @@ class CGConv_v5(nn.Module):
         # Activation functions: Sigmoid (\sigma) and Softplus (g)
         self.sigmoid = nn.Sigmoid()
         self.softplus = nn.Softplus()
+
+        self.cache = {}
+
     def forward(self, v_in_fea, u_fea, edge_idx):
         i_idx, j_idx = edge_idx[0], edge_idx[1]
         
@@ -91,8 +94,97 @@ class CGConv_v5(nn.Module):
         
         # 6. Apply Residual Connection: v_i^{(t+1)} = v_i^{(t)} + aggregated_msg
         atom_out_fea = v_in_fea + aggregated_msg
-        
+        #  線形変換および活性化関数
+        f_z = self.fc_f(z)  # Gate の全結合出力 (Sigmoid直前)
+        s_z = self.fc_s(z)  # Core の全結合出力 (Softplus直前)
+
+        # --- 手動逆伝播のために中間変数をキャッシュ ---
+        self.cache['z'] = z
+        self.cache['f_z'] = f_z
+        self.cache['s_z'] = s_z
+        self.cache['gate_out'] = gate_out
+        self.cache['core_out'] = core_out
         return atom_out_fea
+
+    def manual_backward(self, d_atom_out_fea, v_in_fea, u_fea, edge_idx):
+        """1層分の CGConv の手動逆伝播
+
+        引数:
+            d_atom_out_fea: このConv層の出力に対する勾配 (N_total x D_v)
+            v_in_fea: 入力原子特徴量 (N_total x D_v) u_fea: ボンド特徴量 (E_total x
+            D_u) edge_idx: エッジインデックス (2 x E_total)
+
+        返り値:
+            d_v_in_fea: 1つ手前の層に渡す入力原子特徴量の勾配 (N_total x D_v)
+            conv_grads: この層のパラメータ勾配辞書
+        """
+        i_idx, j_idx = edge_idx[0], edge_idx[1]
+
+        # forward 時のキャッシュ取得
+        z = self.cache['z']
+        f_z = self.cache['f_z']
+        s_z = self.cache['s_z']
+        gate_out = self.cache['gate_out']
+        core_out = self.cache['core_out']
+
+        # ---------------------------------------------------------
+        # Step 6 & 5: 残差接続と集約 (index_add_) の逆伝播
+        # ---------------------------------------------------------
+        # i_idx に集約されていた勾配を各エッジメッセージへスライス抽出mij
+        d_message = d_atom_out_fea[i_idx]  # Shape: E_total x D_v
+
+        # ---------------------------------------------------------
+        # Step 4: 要素積 (\odot) の逆伝播 (相方を掛けて分岐)
+        # ---------------------------------------------------------
+        d_gate_out = d_message * core_out  # Shape: E_total x D_v δ_f
+        d_core_out = d_message * gate_out  # Shape: E_total x D_v δ_c
+
+        # ---------------------------------------------------------
+        # Step 3: 活性化関数と全結合層 (fc_s, fc_f) の逆伝播
+        # ---------------------------------------------------------
+        # Core 側 (Softplus の微分: dy/dx = Sigmoid(s_z))
+        d_s_z = d_core_out * torch.sigmoid(s_z)  # Shape: E_total x D_v
+
+        # Gate 側 (Sigmoid の微分: dy/dx = gate * (1 - gate))
+        d_f_z = d_gate_out * gate_out * (1.0 - gate_out)  # Shape: E_total x D_v
+
+        # 重み・バイアスの勾配計算 (dL/dW = \delta^T * Z, dL/db = \sum \delta)
+        grad_w_s = torch.matmul(d_s_z.T, z)  # Shape: D_v x (2D_v + D_u)
+        grad_b_s = torch.sum(d_s_z, dim=0)  # Shape: D_v
+
+        grad_w_f = torch.matmul(d_f_z.T, z)  # Shape: D_v x (2D_v + D_u)
+        grad_b_f = torch.sum(d_f_z, dim=0)  # Shape: D_v
+
+        # 入力 z に対する勾配 (dL/dz = \delta * W)
+        d_z_core = torch.matmul(d_s_z, self.fc_s.weight)
+        d_z_gate = torch.matmul(d_f_z, self.fc_f.weight)
+        d_z = d_z_core + d_z_gate  # Shape: E_total x (2D_v + D_u)
+
+        # ---------------------------------------------------------
+        # Step 2: Concat の解体 (スライス)
+        # ---------------------------------------------------------
+        d_v_i_fea = d_z[:, : self.D_v]  # Shape: E_total x D_v
+        d_v_j_fea = d_z[:, self.D_v : 2 * self.D_v]  # Shape: E_total x D_v
+
+        # ---------------------------------------------------------
+        # Step 1: 入力原子特徴量 v_in_fea への勾配合算
+        # ---------------------------------------------------------
+        # 1) 残差接続からの直接の勾配 (v_in_fea の微分は 1)
+        d_v_in_fea = d_atom_out_fea.clone()
+
+        # 2) v_i (i_idx) と v_j (j_idx) からの勾配を index_add_ で元の原子位置へ加算
+        d_v_in_fea.index_add_(0, i_idx, d_v_i_fea)
+        d_v_in_fea.index_add_(0, j_idx, d_v_j_fea)
+
+        # 重み・バイアスの勾配を辞書にまとめる
+        conv_grads = {
+            'fc_f.weight': grad_w_f,
+            'fc_f.bias': grad_b_f,
+            'fc_s.weight': grad_w_s,
+            'fc_s.bias': grad_b_s,
+        }
+
+        return d_v_in_fea, conv_grads
 
 class CGConvNet(nn.Module):
     """
@@ -255,9 +347,54 @@ class CGConvNet(nn.Module):
         d_v_c_fea_pooled = torch.matmul(d_fc_in_z, self.conv_to_fc.weight)
 
         # =========================================================
-        # 5. Pooling (Mean Pooling) の逆伝播へ続く...
+        # Step 5: Mean Pooling の逆伝播     dL/dvi=dL/dvc,b*dvc,b/dvi
         # =========================================================
-        # (d_v_c_fea_pooled を使って各原子の勾配へ拡張・分配していきます)
+        # d_v_c_fea_pooled: (B, D_v) ➔ 結晶ごとの勾配
+        # d_v_fea_conv_out: (N_total, D_v) ➔ 全原子の勾配テンソルを初期化
+        d_v_fea_conv_out = torch.zeros_like(self.cache['v_fea_conv_out'])
+
+        for b, idx in enumerate(B_idx):
+            N_b = len(idx)  # 結晶 b に含まれる原子数
+            # 結晶 b の勾配を原子数 N_b で割り、所属する全原子へ均等に分配
+            d_v_fea_conv_out[idx] = d_v_c_fea_pooled[b : b + 1] / N_b
+
+        # =========================================================
+        # Step 6: CGConv（グラフ畳み込み層群）の逆伝播
+        # =========================================================
+        # 最終出力の勾配からスタートして、後ろのConv層から手前へ遡る
+        d_v_fea_conv = d_v_fea_conv_out  # Shape: (N_total, D_v)
+        num_convs = len(self.convs)
+
+        for i in reversed(range(num_convs)):
+            conv = self.convs[i]
+            v_fea_in = self.cache['conv_inputs'][i]  # i番目のConv層への入力
+
+            # 各 CGConv 層内部の手動逆伝播を実行
+            # 入力に対する勾配 d_v_fea_in と、Conv層内部パラメータの勾配辞書を取得
+            d_v_fea_conv, conv_grads = conv.manual_backward(
+                d_v_fea_conv, v_fea_in, u_fea, edge_idx
+            )
+
+            # 取得した勾配を全体辞書 self.grads に保存
+            for param_name, grad_tensor in conv_grads.items():
+                self.grads[f'convs.{i}.{param_name}'] = grad_tensor
+
+        # =========================================================
+        # Step 7: Embedding（線形埋め込み層）の逆伝播
+        # =========================================================
+        # 1層目のConv層から遡ってきた勾配 d_v_fea_conv が、v_fea_emb に対する勾配 d_v_fea_emb に対応
+        d_v_fea_emb = d_v_fea_conv  # Shape: (N_total, D_v)
+        v_fea_raw = self.cache['v_fea_raw']  # Shape: (N_total, orig_D_v)
+
+        # 全結合層 Y = X * W^T + b の微分公式:
+        # dL/dW = δ^T * X  --> Shape: (D_v, orig_D_v)
+        self.grads['embedding.weight'] = torch.matmul(d_v_fea_emb.T, v_fea_raw)
+
+        # dL/db = sum(δ, dim=0)  --> Shape: (D_v,)
+        self.grads['embedding.bias'] = torch.sum(d_v_fea_emb, dim=0)
+
+        # 逆伝播完了: 各パラメータの勾配が入った辞書を返す
+        return self.grads
 
     
 
