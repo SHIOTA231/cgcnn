@@ -25,6 +25,8 @@ class CGConv_v4(nn.Module):
         # g (Softplus)
         self.softplus = nn.Softplus()
 
+        self.cache = {}
+
     def forward(self, v_in_fea, u_fea, edge_idx):
         """
         Parameters
@@ -52,8 +54,103 @@ class CGConv_v4(nn.Module):
         
         # 7. 活性化関数 g を適用
         atom_out_fea = self.softplus(total_in)
+
+        self.cache['z_msg'] = z_msg
+        self.cache['total_in'] = total_in
         
         return atom_out_fea
+
+    def manual_backward(self, d_atom_out_fea, v_in_fea, u_fea, edge_idx):
+        """CGConv_v4 の手動逆伝播
+
+        引数:
+            d_atom_out_fea: 出力勾配 (N_total x D_v)
+            v_in_fea: 入力原子特徴量 (N_total x D_v) u_fea: ボンド特徴量 (E_total x
+            D_u) edge_idx: エッジインデックス (2 x E_total)
+
+        返り値:
+            d_v_in_fea: 入力原子特徴量に対する勾配 (N_total x D_v)
+            conv_grads: パラメータ勾配辞書
+        """
+        i_idx, j_idx = edge_idx[0], edge_idx[1]
+
+        # forward 時のキャッシュ取得
+        z_msg = self.cache['z_msg']
+        total_in = self.cache['total_in']
+
+        # ---------------------------------------------------------
+        # Step 7: Softplus 活性化関数の逆伝播
+        # dy/dx = Sigmoid(x)
+        # ---------------------------------------------------------
+        d_total_in = d_atom_out_fea * torch.sigmoid(
+            total_in
+        )  # Shape: N_total x D_v
+
+        # ---------------------------------------------------------
+        # Step 6: 加算 (total_in = aggregated_msg + self_transformed + self.bias) の逆伝播
+        # 足し算の微分は 1（勾配がそのまま各分岐へ流れる）
+        # ---------------------------------------------------------
+        d_aggregated_msg = d_total_in  # Shape: N_total x D_v
+        d_self_transformed = d_total_in  # Shape: N_total x D_v
+
+        # バイアス b の勾配 (dL/db = sum(d_total_in, dim=0))
+        grad_bias = torch.sum(d_total_in, dim=0)  # Shape: D_v
+
+        # ---------------------------------------------------------
+        # Step 5: 自己更新項 (self_transformed = self.fc_s(v_in_fea)) の逆伝播
+        # ---------------------------------------------------------
+        # W_s の勾配 (dL/dW_s = d_self_transformed^T * v_in_fea)
+        grad_w_s = torch.matmul(d_self_transformed.T, v_in_fea)  # Shape: D_v x D_v
+
+        # v_in_fea への直接の勾配 (dL/dv_in = d_self_transformed * W_s)
+        d_v_in_from_s = torch.matmul(
+            d_self_transformed, self.fc_s.weight
+        )  # Shape: N_total x D_v
+
+        # ---------------------------------------------------------
+        # Step 4: メッセージ集約 (index_add_) の逆伝播
+        # i_idx に集約されていた勾配を各エッジメッセージへスライス抽出
+        # ---------------------------------------------------------
+        d_msg_transformed = d_aggregated_msg[i_idx]  # Shape: E_total x D_v
+
+        # ---------------------------------------------------------
+        # Step 3: メッセージ変換 (msg_transformed = self.fc_c(z_msg)) の逆伝播
+        # ---------------------------------------------------------
+        # W_c の勾配 (dL/dW_c = d_msg_transformed^T * z_msg)
+        grad_w_c = torch.matmul(
+            d_msg_transformed.T, z_msg
+        )  # Shape: D_v x (D_v + D_u)
+
+        # z_msg への勾配 (dL/dz_msg = d_msg_transformed * W_c)
+        d_z_msg = torch.matmul(
+            d_msg_transformed, self.fc_c.weight
+        )  # Shape: E_total x (D_v + D_u)
+
+        # ---------------------------------------------------------
+        # Step 2: Concat (z_msg = [v_j_fea | u_fea]) の解体 (スライス)
+        # ---------------------------------------------------------
+        d_v_j_fea = d_z_msg[:, : self.D_v]  # Shape: E_total x D_v
+
+        # ---------------------------------------------------------
+        # Step 1: 参照 (v_j_fea = v_in_fea[j_idx]) の逆伝播
+        # 各エッジ j_idx から流れてきた勾配を index_add_ で合算
+        # ---------------------------------------------------------
+        d_v_in_from_j = torch.zeros_like(v_in_fea)
+        d_v_in_from_j.index_add_(0, j_idx, d_v_j_fea)  # Shape: N_total x D_v
+
+        # ---------------------------------------------------------
+        # 全ルートからの v_in_fea 勾配の合算
+        # ---------------------------------------------------------
+        d_v_in_fea = d_v_in_from_s + d_v_in_from_j  # Shape: N_total x D_v
+
+        # パラメータの勾配辞書を構築
+        conv_grads = {
+            'fc_c.weight': grad_w_c,
+            'fc_s.weight': grad_w_s,
+            'bias': grad_bias,
+        }
+
+        return d_v_in_fea, conv_grads   
 class CGConv_v5(nn.Module):
     
     def __init__(self, D_v, D_u):
@@ -163,8 +260,8 @@ class CGConv_v5(nn.Module):
         # ---------------------------------------------------------
         # Step 2: Concat の解体 (スライス)
         # ---------------------------------------------------------
-        d_v_i_fea = d_z[:, : self.D_v]  # Shape: E_total x D_v
-        d_v_j_fea = d_z[:, self.D_v : 2 * self.D_v]  # Shape: E_total x D_v
+        d_v_i_fea = d_z[:, : self.D_v]  # Shape: E_total x D_v          #0~Dv列をスライスして、d_v_i_feaに代入
+        d_v_j_fea = d_z[:, self.D_v : 2 * self.D_v]  # Shape: E_total x D_v         #Dv~2*Dv列までをスライスして、d_v_j_feaに代入
 
         # ---------------------------------------------------------
         # Step 1: 入力原子特徴量 v_in_fea への勾配合算
@@ -176,7 +273,7 @@ class CGConv_v5(nn.Module):
         d_v_in_fea.index_add_(0, i_idx, d_v_i_fea)
         d_v_in_fea.index_add_(0, j_idx, d_v_j_fea)
 
-        # 重み・バイアスの勾配を辞書にまとめる
+        # 重み・バイアスの勾配を辞書にまとめる  キー（パラメータの名前）:値(手計算で求めた勾配テンソル)
         conv_grads = {
             'fc_f.weight': grad_w_f,
             'fc_f.bias': grad_b_f,
