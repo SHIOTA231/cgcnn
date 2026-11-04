@@ -58,7 +58,7 @@ class CIFDataset(Dataset):
     def __getitem__(self, idx):
         cif_id, target = self.id_prop_data[idx]
         
-        # CIFファイルの読み込み (pymatgen)
+        # CIFファイルの読み込み (pymatgen)siteの情報(x,y,z)を取得
         cif_path = os.path.join(self.data_dir, f"{cif_id}.cif")
         crystal = Structure.from_file(cif_path)
 
@@ -69,29 +69,30 @@ class CIFDataset(Dataset):
         # 2. 近傍原子の検索 (8.0 Å以内)
         all_nbrs = crystal.get_all_neighbors(self.radius, include_index=True)
         
-        all_nbrs_sorted = []
+        all_nbrs_sorted = []    #最初は空っぽ
         for nbrs in all_nbrs:
             # 距離が近い順にソートし、最大近傍数 max_num_nbr (12個) に制限
-            nbrs = sorted(nbrs, key=lambda x: x[1])
-            all_nbrs_sorted.append(nbrs[:self.max_num_nbr])
+            nbrs = sorted(nbrs, key=lambda x: x[1])     #x[0]は周りの原子の情報が丸ごと入ったデータ、x[1]は距離、x[2]はsiteのindex。x[1]の距離を基準にソートする。
+            all_nbrs_sorted.append(nbrs[:self.max_num_nbr])     #からのリストに、新しくリストを作成し、その原子の近傍原子の情報を入れる。最大12個まで。それを繰り返し、すべての原子の近傍原子情報を入れる。
 
-        # エッジリスト (edge_idx) と 距離アレイの作成
+
+        # 近傍原子のall_nbrs_sortedから、my_cgcnn.pyへ直接入力できるedge_idxとu_feaのテンソルを作る処理
         nbr_i_idx, nbr_j_idx, distances = [], [], []
-        for i, nbrs in enumerate(all_nbrs_sorted):
-            for nbr in nbrs:
+        for i, nbrs in enumerate(all_nbrs_sorted):  #iを選ぶループ
+            for nbr in nbrs:                        #nbrsの中の近傍原子を選ぶループ
                 nbr_i_idx.append(i)          # 受け手原子(i)
-                nbr_j_idx.append(nbr[2])     # 送り手原子(j)
-                distances.append(nbr[1])     # 距離 r_ij
+                nbr_j_idx.append(nbr[2])     # 送り手原子(j)nbr[2]
+                distances.append(nbr[1])     # 距離 r_ijnbr[1]
 
-        nbr_i_idx = torch.LongTensor(nbr_i_idx)
+        nbr_i_idx = torch.LongTensor(nbr_i_idx)     #LongTensorに変換することで、整数のテンソルに変換する。
         nbr_j_idx = torch.LongTensor(nbr_j_idx)
-        edge_idx = torch.stack([nbr_i_idx, nbr_j_idx], dim=0) # Shape: (2, E)
+        edge_idx = torch.stack([nbr_i_idx, nbr_j_idx], dim=0) # Shape: (2, E),dim=0で縦に結合する。1行目が送り手、2行目が受け手の原子番号を表す。
 
         # 3. 距離のガウス展開 (u_fea)
-        distances = np.array(distances)
-        u_fea = torch.Tensor(self.gdf.expand(distances)) # Shape: (E, 41)
+        distances = np.array(distances) # Shape: (E,)、二原子間の実際の距離をただ順番に並べた１次元配列（例: [1.5, 2.1, 1.5, 2.1, ...]
+        u_fea = torch.Tensor(self.gdf.expand(distances)) # Shape: (E, 41)、expand関数で距離をガウス展開して、E個の近傍原子間の距離を41次元のベクトルに変換する。*self.gdf.は引数ではない
 
-        target = torch.Tensor([float(target)])
+        target = torch.Tensor([float(target)])  #Shape:(1,)、教師データの物性値をfloatに変換して、1次元テンソルにする。
 
         return atom_fea, u_fea, edge_idx, target
 
@@ -109,16 +110,16 @@ def collate_fn(dataset_list):
 
     base_atom_idx = 0
     for i, (atom_fea, u_fea, edge_idx, target) in enumerate(dataset_list):
-        num_atoms = atom_fea.shape[0]
+        num_atoms = atom_fea.shape[0]   #shappe[0]は原子数Nを表す。atom_feaは(N, 92)のテンソルなので、shape[0]でNを取得する。
 
         batch_atom_fea.append(atom_fea)
         batch_u_fea.append(u_fea)
         
         # エッジインデックスを全原子IDのオフセット(base_atom_idx)分ずらして結合
-        batch_edge_idx.append(edge_idx + base_atom_idx)
+        batch_edge_idx.append(edge_idx + base_atom_idx)     #2個目以降の結晶のedge_idxは、1個目の結晶の原子数分だけずらす必要がある。base_atom_idxは、これまでに結合した原子数を保持している。
         
         # どの原子がバッチ内の何番目の結晶に属するかを保持
-        crystal_atom_idx.append(torch.arange(base_atom_idx, base_atom_idx + num_atoms))
+        crystal_atom_idx.append(torch.arange(base_atom_idx, base_atom_idx + num_atoms))     #2個目以降の結晶の原子番号は、1個目の結晶の原子数分だけずらす必要がある。base_atom_idxは、これまでに結合した原子数を保持している。
         
         batch_target.append(target)
         base_atom_idx += num_atoms
@@ -126,7 +127,7 @@ def collate_fn(dataset_list):
     # 1つの巨大なテンソルへ縦結合 (Concat)
     atom_fea = torch.cat(batch_atom_fea, dim=0)
     u_fea = torch.cat(batch_u_fea, dim=0)
-    edge_idx = torch.cat(batch_edge_idx, dim=1)
+    edge_idx = torch.cat(batch_edge_idx, dim=1)         #dim=1で横に結合することで、(2, E_total)の形状になる。E_totalはバッチ内の全エッジ数の合計。
     target = torch.stack(batch_target, dim=0)
 
     return atom_fea, u_fea, edge_idx, crystal_atom_idx, target

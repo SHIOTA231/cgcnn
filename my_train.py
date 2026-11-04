@@ -2,7 +2,6 @@ import argparse
 import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 
 # 先ほど作成した自作モジュールから読み込む
@@ -35,9 +34,10 @@ def train_model():
     if args.task == 'regression':
         data_dir = (
             args.data_dir if args.data_dir else 'data/sample-regression'
-        )
-        out_dim = 1  # 予測値は1つの連続数値
-        criterion = nn.L1Loss()  # 損失関数: MAE
+)
+        tr   = 1  # 予測値は1つの連続数値
+        #criterion = nn.L1Loss()  # 損失関数: MAE
+        criterion = nn.MSELoss()  # 損失関数: MSE
     else:  # classification
         data_dir = (
             args.data_dir if args.data_dir else 'data/sample-classification'
@@ -96,9 +96,7 @@ def train_model():
         version='v5',
     ).to(device)
 
-    # 最適化手法: 勾配降下手法Adam
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)    #学習率の自動調整や慣性を持たせることができるAdamを使用し、学習率はコマンドライン引数で指定できるようにする。model.parameters()は重み
-
+    
     # ---------------------------------------------------------
     # 5. 学習ループ (Training & Validation Loop)
     # ---------------------------------------------------------
@@ -127,12 +125,24 @@ def train_model():
             else:
                 target = target.to(device)
 
-            optimizer.zero_grad()       #前回計算した勾配メモをリセット
             out = model(atom_fea, u_fea, edge_idx, crystal_atom_idx)    
             loss = criterion(out, target)
-            loss.backward()             #逆伝播法で計算
-            optimizer.step()            #こうばいを更新
+            B = out.shape[0]
+            d_out = 2.0 * (out.detach() - target) / B
 
+            # 手動逆伝播を実行して勾配辞書を取得
+            manual_grads = model.manual_backward(d_out)
+
+            # 重みの更新 (θ_new = θ_old - lr * grad)
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if name in manual_grads:
+                        # 勾配爆発を防ぐため、勾配の値を [-1.0, 1.0] の範囲に制限する
+                        grad_clipped = torch.clamp(manual_grads[name], -1.0, 1.0)
+                        param.data -= learning_rate * grad_clipped
+
+            # 勾配辞書のクリア
+            model.grads.clear()
             train_loss += loss.item() * len(target)             #1サンプルの平均誤差×サンプル数で、バッチ内の全誤差を計算する。len(target)はバッチ内のサンプル数Bを表す。
 
         train_loss /= train_size
@@ -178,6 +188,63 @@ def train_model():
         "\n学習が完了しました！ベストモデルを my_best_model.pth に保存しました。"
     )
 
+def test_gradient():
+    """手動逆伝播 (manual_backward) と PyTorch Autograd の一致検証関数"""
+    print("=== 勾配チェック（Gradient Check）を開始します ===")
+
+    # 1. 検証用のダミーデータを作成（または DataLoader から 1 バッチ取得）
+    # 例: 3つの原子、4つのエッジ、2つの結晶
+    D_v, D_u = 64, 10
+    N_total, E_total = 3, 4
+
+    v_fea = torch.randn(N_total, D_v, requires_grad=True)
+    u_fea = torch.randn(E_total, D_u)
+    edge_idx = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]], dtype=torch.long)
+    B_idx = [torch.tensor([0, 1]), torch.tensor([2])]  # 2つの結晶
+    target = torch.randn(2, 1)
+
+    # 2. モデルと損失関数の準備
+    model = CGConvNet(D_v, D_u, D_v, tr =1)
+
+    criterion = nn.MSELoss()
+
+    # 3. 順伝播
+    out = model(v_fea, u_fea, edge_idx, B_idx)
+    loss = criterion(out, target)
+
+    # 4. A. PyTorch 標準の自動微分 (Autograd)
+    model.zero_grad()
+    loss.backward()
+
+    # 5. B. 自作した手動逆伝播 (d_out = 2 * (out - target) / B)
+    # MSE Loss (L = 1/B * sum((out - target)^2)) の微分
+    d_out = 2.0 * (out.detach() - target) / out.shape[0]
+    manual_grads = model.manual_backward(d_out)
+
+    # 6. C. 両者の勾配の差分を比較
+    print("\n--- パラメータごとの勾配差分 ---")
+    all_passed = True
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        auto_grad = param.grad
+        manual_grad = manual_grads[name]
+
+        max_diff = torch.max(torch.abs(auto_grad - manual_grad)).item()
+        print(f"{name:30s} | 最大差分: {max_diff:.8e}")
+
+        if max_diff > 1e-4:
+            all_passed = False
+
+    if all_passed:
+        print("\n✅ すべてのパラメータで勾配が一致しました！")
+    else:
+        print("\n❌ 勾配にズレがあるパラメータが存在します。確認が必要です。")
+
 
 if __name__ == '__main__':
-    train_model()
+    # 勾配の検証だけを行いたい場合:
+    #test_gradient()
+
+    # 通常の学習を行いたい場合は上をコメントアウトして以下を実行:
+     train_model()
