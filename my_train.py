@@ -7,6 +7,8 @@ from torch.utils.data import DataLoader, random_split
 # 先ほど作成した自作モジュールから読み込む
 from my_cgcnn import CGConvNet
 from my_dataset import CIFDataset, collate_fn
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning)
 
 
 def train_model():
@@ -35,7 +37,7 @@ def train_model():
         data_dir = (
             args.data_dir if args.data_dir else 'data/sample-regression'
 )
-        tr   = 1  # 予測値は1つの連続数値
+        out_dim = 1  # 予測値は1つの連続数値
         #criterion = nn.L1Loss()  # 損失関数: MAE
         criterion = nn.MSELoss()  # 損失関数: MSE
     else:  # classification
@@ -63,9 +65,11 @@ def train_model():
 
     # データを 8:2（学習用:検証用）にランダム分割
     train_size = int(0.8 * total_len)
-    val_size = total_len - train_size
+    val_size = int(0.1*total_len)
+    test_size = total_len - train_size - val_size
     train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size]
+        full_dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42),  
     )
 
     train_loader = DataLoader(
@@ -179,10 +183,10 @@ def train_model():
             f"Epoch [{epoch:02d}/{epochs:02d}] | Train Loss: {train_loss:.4f}"
             f" | Val Loss: {val_loss:.4f}"
         )
-
+        save_path = os.path.join(data_dir, 'my_best_model.pth')
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), 'my_best_model.pth')
+            torch.save(model.state_dict(), save_path)
 
     print(
         "\n学習が完了しました！ベストモデルを my_best_model.pth に保存しました。"

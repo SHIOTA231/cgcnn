@@ -127,7 +127,7 @@ class CGConv_v4(nn.Module):
         )  # Shape: E_total x (D_v + D_u)
 
         # ---------------------------------------------------------
-        # Step 2: Concat (z_msg = [v_j_fea | u_fea]) の解体 (スライス)
+        # Step 2: Concat (z_msg = [v_j_fea | u_fea]) の解体 (スライス) zを解体するだけ
         # ---------------------------------------------------------
         d_v_j_fea = d_z_msg[:, : self.D_v]  # Shape: E_total x D_v
 
@@ -287,7 +287,7 @@ class CGConvNet(nn.Module):
     """
     Crystal Graph Convolutional Neural Network
     """
-    def __init__(self, orig_D_v, D_u, D_v=64, t_conv=3, hidden_fea_len=128, L_hidden=1, out_dim=1, classification=False, version='v5'):   # out_dim: target dimension or num classes
+    def __init__(self, orig_D_v, D_u, D_v=64, t_conv=3, hidden_fea_len=128, L_hidden=1, out_dim=2, classification=False, version='v5'):   # out_dim: target dimension or num classes
         super(CGConvNet, self).__init__()
         self.version = version
         self.L_hidden = L_hidden
@@ -324,8 +324,19 @@ class CGConvNet(nn.Module):
         self.cache['v_fea_raw'] = (
             v_fea  # 埋め込み層(Linear)の逆伝播で使うため保存
         )
+        x = self.embedding(v_fea)  # 埋め込み層の出力 (N_total x D_v)
+        conv_inputs = []  # 各Conv層への入力を保存するリスト
+        for conv in self.convs:
+        # Conv層に入る前の原子特徴量を保存
+            conv_inputs.append(x)
+            x = conv(x, u_fea, edge_idx)
+                
         self.cache['v_fea_emb'] = v_fea_emb
-
+        self.cache['u_fea'] = u_fea
+        self.cache['edge_idx'] = edge_idx
+        self.cache['B_idx'] = B_idx
+        self.cache['conv_inputs'] = conv_inputs
+            
         # Step 2: Pass through CGConv layers
         v_fea_conv = v_fea_emb
         self.cache['conv_inputs'] = []  # 各Conv層への入力を保存するリスト
@@ -368,18 +379,23 @@ class CGConvNet(nn.Module):
 
         # 最終的な隠れ表現を保存（fc_out への入力）
         self.cache['last_hidden_act'] = v_c_fea_act
+        
 
         out = self.fc_out(v_c_fea_act)
         self.cache['out'] = out
 
         return out
     
-    def manual_backward(self, target):
+    def manual_backward(self, d_out):
         """出力 Loss から入力に向かって、連鎖律に従って手動で微分を遡っていく！"""
         out = self.cache['out']
         v_c_fea_act = self.cache['v_c_fea_act']
         fc_in_z = self.cache['fc_in_z']
         v_c_fea_pooled = self.cache['v_c_fea_pooled']
+        u_fea = self.cache['u_fea']
+        edge_idx = self.cache['edge_idx']
+        conv_inputs = self.cache['conv_inputs']
+        B_idx = self.cache['B_idx']
 
         B = out.shape[0]  # 最終出力B×out_dimの[0]番目の次元がバッチサイズBと定義
 
@@ -387,7 +403,7 @@ class CGConvNet(nn.Module):
         # 1. 損失関数 (MSE Loss) の微分: dL / d(out)
         # =========================================================
         # L = (1/B) * sum((out - target)^2)  ==>  dL/dout = (2/B) * (out - target)
-        d_out = (2.0 / B) * (out - target)
+        #d_out = (2.0 / B) * (out - target)         ←昔、引数をd_outではなく、targetとしており、d_outに変更したためコメントアウトした。
 
         # =========================================================
         # 2. 出力層 (fc_out: Y = X * W + b) の逆伝播
@@ -464,7 +480,7 @@ class CGConvNet(nn.Module):
 
         for i in reversed(range(num_convs)):
             conv = self.convs[i]
-            v_fea_in = self.cache['conv_inputs'][i]  # i番目のConv層への入力
+            v_fea_in = conv_inputs[i]  # i番目のConv層への入力
 
             # 各 CGConv 層内部の手動逆伝播を実行
             # 入力に対する勾配 d_v_fea_in と、Conv層内部パラメータの勾配辞書を取得

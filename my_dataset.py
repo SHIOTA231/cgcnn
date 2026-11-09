@@ -33,8 +33,12 @@ class CIFDataset(Dataset):
         self.max_num_nbr = max_num_nbr  #最大近傍原子数
         self.radius = radius            #カットオフ半径
 
+        # data/regression/formation_energy_per_atom の2つ上の階層の cifs フォルダを参照
+        base_dir = os.path.dirname(os.path.dirname(data_dir)) # 'data' フォルダ
+        self.cif_dir = os.path.expanduser('~/cgcnn/data/cifs')
+
         # 1. atom_init.json の読み込み
-        atom_init_path = os.path.join(self.data_dir, 'atom_init.json')
+        atom_init_path = '/home/falufito/cgcnn/data/atom_init.json'
         assert os.path.exists(atom_init_path), f"{atom_init_path} が存在しません"
         with open(atom_init_path) as f:
             atom_init = json.load(f)        #json形式の辞書を読み込むためのおまじない
@@ -50,17 +54,17 @@ class CIFDataset(Dataset):
             self.id_prop_data = [row for row in reader]
 
         # 3. ガウス展開器の準備
-        self.gdf = GaussianDistance(dmin=dmin, dmax=self.radius, step=step)
+        self.gdf = GaussianDistance(dmin=dmin, dmax=self.radius, step=step)         
 
     def __len__(self):
-        return len(self.id_prop_data)
+        return len(self.id_prop_data)       #何個のリストがあるかを返す。つまり、何個の結晶構造があるかを返す。
 
     def __getitem__(self, idx):
         cif_id, target = self.id_prop_data[idx]
         
         # CIFファイルの読み込み (pymatgen)siteの情報(x,y,z)を取得
-        cif_path = os.path.join(self.data_dir, f"{cif_id}.cif")
-        crystal = Structure.from_file(cif_path)
+        cif_path = os.path.join(self.cif_dir, f"{cif_id}.cif")
+        crystal = Structure.from_file(cif_path)             #pymatgenのStructureクラスを使って、CIFファイルから結晶構造を読み込む。crystalは結晶構造の情報が入ったオブジェクト。
 
         # 1. 原子特徴量 (v_fea) の構築
         atom_fea = torch.vstack([self.atom_features[site.specie.Z] for site in crystal]) # Shape: (N, 92),Zは原子番号を表す。よって結晶内Nこの原子を取得し、N×92のテンソルを作成する。
@@ -94,10 +98,10 @@ class CIFDataset(Dataset):
 
         target = torch.Tensor([float(target)])  #Shape:(1,)、教師データの物性値をfloatに変換して、1次元テンソルにする。
 
-        return atom_fea, u_fea, edge_idx, target
+        return (atom_fea, u_fea, edge_idx), torch.Tensor([float(target)])
 
 
-def collate_fn(dataset_list):
+def collate_fn(dataset_list):       #照合
     """
     DataLoader がバッチ化する際に呼び出す関数
     複数の結晶の atom_fea, u_fea, edge_idx を縦に連結し、B_idx (crystal_atom_idx) を生成する
@@ -109,8 +113,8 @@ def collate_fn(dataset_list):
     batch_target = []
 
     base_atom_idx = 0
-    for i, (atom_fea, u_fea, edge_idx, target) in enumerate(dataset_list):
-        num_atoms = atom_fea.shape[0]   #shappe[0]は原子数Nを表す。atom_feaは(N, 92)のテンソルなので、shape[0]でNを取得する。
+    for i, ((atom_fea, u_fea, edge_idx), target) in enumerate(dataset_list):
+        num_atoms = atom_fea.shape[0]   #shape[0]は原子数Nを表す。atom_feaは(N, 92)のテンソルなので、shape[0]でNを取得する。
 
         batch_atom_fea.append(atom_fea)
         batch_u_fea.append(u_fea)
@@ -137,8 +141,8 @@ def collate_fn(dataset_list):
 # 動作確認テスト
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    # サンプルデータのパスを指定（sample-regression または sample-classification）
-    data_path = 'data/sample-regression'
+    #データのパスを指定
+    data_path = 'data/regression/band_gap'  # 例: 'data/regression/band_gap' または 'data/classification/metal'
     
     if os.path.exists(data_path):
         dataset = CIFDataset(data_dir=data_path)
