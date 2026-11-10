@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, random_split
 # 先ほど作成した自作モジュールから読み込む
 from my_cgcnn import CGConvNet
 from my_dataset import CIFDataset, collate_fn
+from my_device import get_device
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -28,6 +29,10 @@ def train_model():
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--lr', type=float, default=0.005)
+    parser.add_argument(
+        '--device', choices=['auto', 'cpu', 'cuda'], default='auto',
+        help='実行デバイス（autoはCUDAが使えればGPU、そうでなければCPU）',
+    )
     args = parser.parse_args()
 
     # ---------------------------------------------------------
@@ -47,12 +52,16 @@ def train_model():
         out_dim = 2  # 2クラス分類（例: 0 または 1）
         criterion = nn.CrossEntropyLoss()  # 損失関数: クロスエントロピー
 
+    # 相対パスは、このスクリプトが置かれたフォルダ（srv〇〇）を基準にする
+    if not os.path.isabs(data_dir):
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), data_dir)
+
     batch_size = args.batch_size
     epochs = args.epochs
     learning_rate = args.lr
 
     # GPUが使える場合はGPU、なければCPUを使用
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = get_device(args.device)
     print(
         f"使用デバイス: {device} | タスク: {args.task} | データパス: {data_dir}"
     )
@@ -63,11 +72,11 @@ def train_model():
     full_dataset = CIFDataset(data_dir=data_dir)
     total_len = len(full_dataset)
 
-    # データを 8:2（学習用:検証用）にランダム分割
+    # データを 8:1:1（学習用:検証用:未使用テスト用）にランダム分割
     train_size = int(0.8 * total_len)
     val_size = int(0.1*total_len)
     test_size = total_len - train_size - val_size
-    train_dataset, val_dataset = random_split(
+    train_dataset, val_dataset, _test_dataset = random_split(
         full_dataset, [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(42),  
     )
@@ -85,7 +94,10 @@ def train_model():
         collate_fn=collate_fn,
     )
 
-    print(f"全データ数: {total_len} (学習用: {train_size}, 検証用: {val_size})")
+    print(
+        f"全データ数: {total_len} "
+        f"(学習用: {train_size}, 検証用: {val_size}, テスト用: {test_size})"
+    )
 
     # ---------------------------------------------------------
     # 4. モデル、オプティマイザの初期化

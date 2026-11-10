@@ -1,6 +1,7 @@
 import os
 import csv
 import json
+from pathlib import Path
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
@@ -29,16 +30,19 @@ class CIFDataset(Dataset):
     CIFファイル群と id_prop.csv からグラフ構造データを動的に生成するDataset
     """
     def __init__(self, data_dir, max_num_nbr=12, radius=8.0, dmin=0, step=0.2):
-        self.data_dir = data_dir        #結晶構造CIFと教師データ格納フォルダ
+        project_dir = Path(__file__).resolve().parent
+        data_path = Path(data_dir).expanduser()
+        if not data_path.is_absolute():
+            data_path = project_dir / data_path
+        self.data_dir = str(data_path)   #結晶構造CIFと教師データ格納フォルダ
         self.max_num_nbr = max_num_nbr  #最大近傍原子数
         self.radius = radius            #カットオフ半径
 
         # data/regression/formation_energy_per_atom の2つ上の階層の cifs フォルダを参照
-        base_dir = os.path.dirname(os.path.dirname(data_dir)) # 'data' フォルダ
-        self.cif_dir = os.path.expanduser('~/cgcnn/data/cifs')
+        self.cif_dir = str(project_dir / 'data' / 'cifs')
 
         # 1. atom_init.json の読み込み
-        atom_init_path = '/home/falufito/cgcnn/data/atom_init.json'
+        atom_init_path = project_dir / 'data' / 'atom_init.json'
         assert os.path.exists(atom_init_path), f"{atom_init_path} が存在しません"
         with open(atom_init_path) as f:
             atom_init = json.load(f)        #json形式の辞書を読み込むためのおまじない

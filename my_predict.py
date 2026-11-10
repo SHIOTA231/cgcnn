@@ -1,13 +1,24 @@
+import argparse
+import os
 import torch
 from torch.utils.data import DataLoader
 from my_cgcnn import CGConvNet
-from my_train import CIFDataset, collate_fn
+from my_dataset import CIFDataset, collate_fn
+from my_device import get_device
 
 def predict():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    parser = argparse.ArgumentParser(description='CGCNN prediction')
+    parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    parser.add_argument('--data_dir', default='data/sample-regression')
+    parser.add_argument('--model', default='my_best_model.pth')
+    args = parser.parse_args()
+    device = get_device(args.device)
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isabs(args.model):
+        args.model = os.path.join(project_dir, args.model)
 
     # 1. 予測対象データセットの準備（ここでは sample-regression を使用）
-    data_dir = 'data/sample-regression'
+    data_dir = args.data_dir
     dataset = CIFDataset(data_dir=data_dir)
     test_loader = DataLoader(
         dataset, batch_size=1, shuffle=False, collate_fn=collate_fn
@@ -25,7 +36,7 @@ def predict():
     ).to(device)
 
     # 保存したベストモデルのパラメータを読み込み
-    model.load_state_dict(torch.load('my_best_model.pth', map_location=device))
+    model.load_state_dict(torch.load(args.model, map_location=device))
     model.eval()
 
     print("=== CGCNN 物性予測（推論）開始 ===\n")

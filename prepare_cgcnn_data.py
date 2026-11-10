@@ -2,15 +2,26 @@
 import os
 import json
 import csv
+import argparse
 import pandas as pd
 from pymatgen.core import Structure
 
 # --- 1. ディレクトリの準備 ---
-CIF_DIR = os.path.join("data", "cifs")
+parser = argparse.ArgumentParser(description="Prepare CGCNN CIF and property data")
+parser.add_argument(
+    "--csv", default="data/df_wB.csv",
+    help="入力CSV（既定: srv〇〇/data/df_wB.csv）",
+)
+args = parser.parse_args()
+
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.expanduser(args.csv)
+if not os.path.isabs(CSV_PATH):
+    CSV_PATH = os.path.join(PROJECT_DIR, CSV_PATH)
+CIF_DIR = os.path.join(PROJECT_DIR, "data", "cifs")
 os.makedirs(CIF_DIR, exist_ok=True)
 
 # 読み込むファイル（体積弾性率のあるデータを使う場合は df_wB.csv）
-CSV_PATH = os.path.expanduser("~/machine-learning.org/codes/pymatgen/df_wB.csv")
 print(f"'{CSV_PATH}' を読み込み中...")
 df = pd.read_csv(CSV_PATH)
 
@@ -21,6 +32,10 @@ TARGET_PROPERTIES = {
     "formation_energy_per_atom": "formation_energy", # 生成エネルギー
     "band_gap": "band_gap"                          # バンドギャップ
 }
+
+# bulk modulus は 1～1000 GPa のデータだけを採用（両端を含む）
+K_VRH_MIN_GPA = 1.0
+K_VRH_MAX_GPA = 1000.0
 
 # 物性ごとの id_prop リストを初期化
 id_prop_dict = {prop: [] for prop in TARGET_PROPERTIES.keys()}
@@ -45,11 +60,20 @@ for idx, row in df.iterrows():
     for prop_key in TARGET_PROPERTIES.keys():
         val = row[prop_key]
         if pd.notna(val) and pd.notna(row["structure"]):
+            if prop_key == "K_VRH":
+                try:
+                    val = float(val)
+                except (TypeError, ValueError):
+                    continue
+
+                if not K_VRH_MIN_GPA <= val <= K_VRH_MAX_GPA:
+                    continue
+
             id_prop_dict[prop_key].append([mat_id, val])
 
 # --- 4. 物性ごとの id_prop.csv の書き出し ---
 for prop_key, folder_name in TARGET_PROPERTIES.items():
-    output_dir = os.path.join("data", "regression", folder_name)
+    output_dir = os.path.join(PROJECT_DIR, "data", "regression", folder_name)
     os.makedirs(output_dir, exist_ok=True)
     
     id_prop_path = os.path.join(output_dir, "id_prop.csv")

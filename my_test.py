@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, random_split
 # 自作モジュールからの読み込み
 from my_cgcnn import CGConvNet
 from my_dataset import CIFDataset, collate_fn
+from my_device import get_device
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -22,6 +23,10 @@ def train_model():
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=0.005)
+    parser.add_argument(
+        '--device', choices=['auto', 'cpu', 'cuda'], default='auto',
+        help='実行デバイス（autoはCUDAが使えればGPU、そうでなければCPU）',
+    )
     args = parser.parse_args()
 
     # ---------------------------------------------------------
@@ -36,7 +41,11 @@ def train_model():
         out_dim = 2
         criterion = nn.CrossEntropyLoss()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 相対パスは、このスクリプトが置かれたフォルダ（srv〇〇）を基準にする
+    if not os.path.isabs(data_dir):
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), data_dir)
+
+    device = get_device(args.device)
     print(f"使用デバイス: {device} | タスク: {args.task} | データパス: {data_dir}")
 
     # ---------------------------------------------------------
