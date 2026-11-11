@@ -6,10 +6,10 @@ import argparse
 import pandas as pd
 from pymatgen.core import Structure
 
-# --- 1. ディレクトリの準備 ---
+# --- 1. ディレクトリの準備 --csvのパス
 parser = argparse.ArgumentParser(description="Prepare CGCNN CIF and property data")
 parser.add_argument(
-    "--csv", default="data/df_wB.csv",
+    "--csv", default="~/machine-learning.org/codes/pymatgen/df-all.csv",
     help="入力CSV（既定: srv〇〇/data/df_wB.csv）",
 )
 args = parser.parse_args()
@@ -30,11 +30,15 @@ df = pd.read_csv(CSV_PATH)
 TARGET_PROPERTIES = {
     "K_VRH": "bulk_modulus",                       # 体積弾性率
     "formation_energy_per_atom": "formation_energy", # 生成エネルギー
-    "band_gap": "band_gap"                          # バンドギャップ
+    "band_gap": "band_gap",                          # バンドギャップ
+    "energy_per_atom": "absolute_energy",              # 原子あたりのエネルギー
+    "efermi": "fermi_energy",                            # フェルミエネルギー
+    "G_VRH": "shear_modulus",                            # せん断弾性率
+    "poisson_ratio": "poisson_ratio",                      # ポアソン比
 }
 
 # bulk modulus は 1～1000 GPa のデータだけを採用（両端を含む）
-K_VRH_MIN_GPA = 1.0
+K_VRH_MIN_GPA = 0
 K_VRH_MAX_GPA = 1000.0
 
 # 物性ごとの id_prop リストを初期化
@@ -73,7 +77,7 @@ for idx, row in df.iterrows():
 
 # --- 4. 物性ごとの id_prop.csv の書き出し ---
 for prop_key, folder_name in TARGET_PROPERTIES.items():
-    output_dir = os.path.join(PROJECT_DIR, "data", "regression", folder_name)
+    output_dir = os.path.join(PROJECT_DIR, "data", "regression", folder_name)       #保存先パス
     os.makedirs(output_dir, exist_ok=True)
     
     id_prop_path = os.path.join(output_dir, "id_prop.csv")

@@ -12,19 +12,10 @@ class CGConv_v4(nn.Module):
         super(CGConv_v4, self).__init__()
         self.D_v = D_v
         self.D_u = D_u
-        
-        # v_j (D_v) + u (D_u) -> D_v
-        self.fc_c = nn.Linear(self.D_v + self.D_u, self.D_v, bias=False)
-        
-        # v_i (D_v) -> D_v
-        self.fc_s = nn.Linear(self.D_v, self.D_v, bias=False)
-        
-        # b
-        self.bias = nn.Parameter(torch.zeros(self.D_v))
-        
-        # g (Softplus)
+        self.fc_c = nn.Linear(self.D_v + self.D_u, self.D_v, bias=False)        #1. v_j (D_v) + u (D_u) -> D_v
+        self.fc_s = nn.Linear(self.D_v, self.D_v, bias=False)                   #2. v_i (D_v) -> D_v
+        self.bias = nn.Parameter(torch.zeros(self.D_v))                         #3. b (D_v)
         self.softplus = nn.Softplus()
-
         self.cache = {}
 
     def forward(self, v_in_fea, u_fea, edge_idx):
@@ -35,26 +26,15 @@ class CGConv_v4(nn.Module):
         u_fea    : torch.Tensor (E_total x D_u)
         edge_idx    : torch.LongTensor (2 x E_total)                 一行目が送り手、二行目が受け手
         """
-        i_idx, j_idx = edge_idx[0], edge_idx[1]                      #iを０jを１という風においた。
-        # v_j
-        v_j_fea = v_in_fea[j_idx]  # E_total x D_v
-        # 2. v_j ⊕ u 
-        z_msg = torch.cat([v_j_fea, u_fea], dim=1)     #(E_total x (D_v + D_u))
-        # 3. (v_j ⊕ u) W_c
-        msg_transformed = self.fc_c(z_msg)      #(E_total x D_v)
-        # 4. エッジごとのメッセージを受信原子 i ごとに集約 (∑_{j,k})
-        # (N_total x D_v のゼロ行列に index_add_)
-        aggregated_msg = torch.zeros_like(v_in_fea)
-        aggregated_msg.index_add_(0, i_idx, msg_transformed)    #Σjk
-        # 5. v_i W_s を計算 (N_total x D_v)
-        self_transformed = self.fc_s(v_in_fea)
-        
-        # 6. 集約メッセージ + 自己更新項 + バイアス b
-        total_in = aggregated_msg + self_transformed + self.bias
-        
-        # 7. 活性化関数 g を適用
-        atom_out_fea = self.softplus(total_in)
-
+        i_idx, j_idx = edge_idx[0], edge_idx[1]                                 #4. iを０jを１という風においた。
+        v_j_fea = v_in_fea[j_idx]                                               #5. E_total x D_v
+        z_msg = torch.cat([v_j_fea, u_fea], dim=1)                              #6. (E_total x (D_v + D_u)) v_j ⊕ u
+        msg_transformed = self.fc_c(z_msg)                                      #7. (E_total x D_v) z*=(v_j ⊕ u) W_c
+        aggregated_msg = torch.zeros_like(v_in_fea)                             #8. (N_total x D_v) 受信原子ごとに集約されたメッセージのゼロ行列作成
+        aggregated_msg.index_add_(0, i_idx, msg_transformed)                    #9. Σjk
+        self_transformed = self.fc_s(v_in_fea)                                  #10. (N_total x D_v) v_i W_s
+        total_in = aggregated_msg + self_transformed + self.bias                #11. mij                
+        atom_out_fea = self.softplus(total_in)                                  #12. softplus(mij)
         self.cache['z_msg'] = z_msg
         self.cache['total_in'] = total_in
         
@@ -73,44 +53,23 @@ class CGConv_v4(nn.Module):
             conv_grads: パラメータ勾配辞書
         """
         i_idx, j_idx = edge_idx[0], edge_idx[1]
-
-        # forward 時のキャッシュ取得
         z_msg = self.cache['z_msg']
         total_in = self.cache['total_in']
-
-        # ---------------------------------------------------------
-        # Step 7: Softplus 活性化関数の逆伝播
-        # dy/dx = Sigmoid(x)
-        # ---------------------------------------------------------
-        d_total_in = d_atom_out_fea * torch.sigmoid(
-            total_in
-        )  # Shape: N_total x D_v
-
-        # ---------------------------------------------------------
+        d_total_in = d_atom_out_fea * torch.sigmoid(                            #13. dy/dx = Sigmoid(x)
+        total_in                                                                # Shape: N_total x D_v
+        )                                                                       
         # Step 6: 加算 (total_in = aggregated_msg + self_transformed + self.bias) の逆伝播
         # 足し算の微分は 1（勾配がそのまま各分岐へ流れる）
-        # ---------------------------------------------------------
         d_aggregated_msg = d_total_in  # Shape: N_total x D_v
         d_self_transformed = d_total_in  # Shape: N_total x D_v
-
         # バイアス b の勾配 (dL/db = sum(d_total_in, dim=0))
         grad_bias = torch.sum(d_total_in, dim=0)  # Shape: D_v
-
-        # ---------------------------------------------------------
-        # Step 5: 自己更新項 (self_transformed = self.fc_s(v_in_fea)) の逆伝播
-        # ---------------------------------------------------------
         # W_s の勾配 (dL/dW_s = d_self_transformed^T * v_in_fea)
         grad_w_s = torch.matmul(d_self_transformed.T, v_in_fea)  # Shape: D_v x D_v
-
         # v_in_fea への直接の勾配 (dL/dv_in = d_self_transformed * W_s)
         d_v_in_from_s = torch.matmul(
             d_self_transformed, self.fc_s.weight
         )  # Shape: N_total x D_v
-
-        # ---------------------------------------------------------
-        # Step 4: メッセージ集約 (index_add_) の逆伝播
-        # i_idx に集約されていた勾配を各エッジメッセージへスライス抽出
-        # ---------------------------------------------------------
         d_msg_transformed = d_aggregated_msg[i_idx]  # Shape: E_total x D_v
 
         # ---------------------------------------------------------
