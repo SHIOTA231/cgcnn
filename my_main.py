@@ -2,14 +2,13 @@ import argparse
 import os
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 
 # 先ほど作成した自作モジュールから読み込む
 from my_cgcnn import CGConvNet
 from my_dataset import CIFDataset, collate_fn
 from my_device import get_device
-import warnings
-warnings.filterwarnings('ignore', category=UserWarning)
+
 
 
 def train_model():
@@ -32,6 +31,10 @@ def train_model():
     parser.add_argument(
         '--device', choices=['auto', 'cpu', 'cuda'], default='auto',
         help='実行デバイス（autoはCUDAが使えればGPU、そうでなければCPU）',
+    )
+    parser.add_argument(
+        '--target_transform', choices=['auto', 'none', 'ln'], default='auto',
+        help='回帰ターゲットの変換。autoはbulk_modulusで自然対数を使用',
     )
     args = parser.parse_args()
 
@@ -56,6 +59,18 @@ def train_model():
     if not os.path.isabs(data_dir):
         data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), data_dir)
 
+    if args.task == 'regression':
+        if args.target_transform == 'auto':
+            target_transform = (
+                'ln' if os.path.basename(os.path.normpath(data_dir)) == 'bulk_modulus'
+                else 'none'
+            )
+        else:
+            target_transform = args.target_transform
+    else:
+        target_transform = 'none'
+    use_log_target = target_transform == 'ln'
+
     batch_size = args.batch_size
     epochs = args.epochs
     learning_rate = args.lr
@@ -72,14 +87,51 @@ def train_model():
     full_dataset = CIFDataset(data_dir=data_dir)
     total_len = len(full_dataset)
 
+    # ln(K_VRH) を使う場合、0以下には自然対数を定義できないため除外する。
+    valid_indices = list(range(total_len))
+    if use_log_target:
+        valid_indices = [
+            i for i, row in enumerate(full_dataset.id_prop_data)
+            if float(row[1]) > 0
+        ]
+        if not valid_indices:
+            raise ValueError('自然対数変換できる正のターゲット値がありません。')
+    eligible_dataset = Subset(full_dataset, valid_indices)
+    effective_len = len(eligible_dataset)
+
     # データを 8:1:1（学習用:検証用:未使用テスト用）にランダム分割
-    train_size = int(0.8 * total_len)
-    val_size = int(0.1*total_len)
-    test_size = total_len - train_size - val_size
+    train_size = int(0.8 * effective_len)
+    val_size = int(0.1 * effective_len)
+    test_size = effective_len - train_size - val_size
     train_dataset, val_dataset, _test_dataset = random_split(
-        full_dataset, [train_size, val_size, test_size],
+        eligible_dataset, [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(42),  
     )
+
+    # 回帰ターゲットの平均・標準偏差は訓練データだけから計算する。
+    # 検証・テストデータの情報が学習に混ざるのを防ぐ。
+    target_mean = None
+    target_std = None
+    if args.task == 'regression':
+        train_targets = torch.tensor(
+            [
+                float(full_dataset.id_prop_data[valid_indices[i]][1])
+                for i in train_dataset.indices
+            ],
+            dtype=torch.float32,
+        )
+        if use_log_target:
+            train_targets = torch.log(train_targets)
+        target_mean = train_targets.mean().item()
+        target_std = train_targets.std().item()
+        if not torch.isfinite(torch.tensor(target_std)) or target_std == 0:
+            raise ValueError('訓練データのターゲット標準偏差が0または不正です。')
+        print(
+            f"ターゲット変換: "
+            f"{'自然対数 ln' if use_log_target else 'なし'} | "
+            f"変換後の平均={target_mean:.6g}, "
+            f"標準偏差={target_std:.6g}"
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -102,7 +154,8 @@ def train_model():
 
     print(
         f"全データ数: {total_len} "
-        f"(学習用: {train_size}, 検証用: {val_size}, テスト用: {test_size})"
+        f"(使用可能: {effective_len}, 対数対象外: {total_len - effective_len}; "
+        f"学習用: {train_size}, 検証用: {val_size}, テスト用: {test_size})"
     )
 
     # ---------------------------------------------------------
@@ -145,7 +198,9 @@ def train_model():
             if args.task == 'classification':
                 target = target.to(device).squeeze(1).long()
             else:
-                target = target.to(device)
+                target_raw = target.to(device)
+                target = torch.log(target_raw) if use_log_target else target_raw
+                target = (target - target_mean) / target_std
 
             out = model(atom_fea, u_fea, edge_idx, crystal_atom_idx)    
             loss = criterion(out, target)
@@ -172,6 +227,7 @@ def train_model():
         # --- 検証フェーズ ---
         model.eval()
         val_loss = 0.0
+        val_mae = 0.0
 
         with torch.no_grad():           #評価用なので勾配の更新はしない。no_grad()でこのブロックの中では勾配計算や保存を行わないでください
             for (
@@ -190,21 +246,51 @@ def train_model():
                     target = target.to(device).squeeze(1).long()        #分類の教師データは0,1でCrossEntropyに渡すので、整数型のlongに変換する必要がある。squeeze(1)で形状を(B,1)→(B,)に変換する。
                 else:
                     target = target.to(device)
+                    target_raw = target
+                    target = torch.log(target) if use_log_target else target
+                    target = (target - target_mean) / target_std
 
                 out = model(atom_fea, u_fea, edge_idx, crystal_atom_idx)
                 loss = criterion(out, target)
                 val_loss += loss.item() * len(target)
+                if args.task == 'regression':
+                    pred_transformed = out * target_std + target_mean
+                    pred_raw = (
+                        torch.exp(pred_transformed)
+                        if use_log_target else pred_transformed
+                    )
+                    val_mae += torch.sum(torch.abs(pred_raw - target_raw)).item()
 
         val_loss /= val_size
+        if args.task == 'regression':
+            val_mae /= val_size
 
-        print(
-            f"Epoch [{epoch:02d}/{epochs:02d}] | Train Loss: {train_loss:.4f}"
-            f" | Val Loss: {val_loss:.4f}"
-        )
+        if args.task == 'regression':
+            print(
+                f"Epoch [{epoch:02d}/{epochs:02d}] | "
+                f"Train Loss (標準化MSE): {train_loss:.4f} | "
+                f"Val Loss (標準化MSE): {val_loss:.4f} | "
+                f"Val MAE (元の単位): {val_mae:.4f}"
+            )
+        else:
+            print(
+                f"Epoch [{epoch:02d}/{epochs:02d}] | Train Loss: {train_loss:.4f}"
+                f" | Val Loss: {val_loss:.4f}"
+            )
         save_path = os.path.join(data_dir, 'my_best_model.pth')
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), save_path)
+            torch.save(
+                {
+                    'state_dict': model.state_dict(),
+                    'target_mean': target_mean,
+                    'target_std': target_std,
+                    'target_transform': target_transform,
+                    'task': args.task,
+                    'property_name': os.path.basename(os.path.normpath(data_dir)),
+                },
+                save_path,
+            )
 
     print(
         "\n学習が完了しました！ベストモデルを my_best_model.pth に保存しました。"
@@ -212,7 +298,12 @@ def train_model():
 
     # --- テストフェーズ：検証損失が最小だったモデルで未使用データを評価 ---
     save_path = os.path.join(data_dir, 'my_best_model.pth')
-    model.load_state_dict(torch.load(save_path, map_location=device))
+    checkpoint = torch.load(save_path, map_location=device)
+    model.load_state_dict(checkpoint['state_dict'])
+    target_mean = checkpoint['target_mean']
+    target_std = checkpoint['target_std']
+    target_transform = checkpoint.get('target_transform', 'none')
+    use_log_target = target_transform == 'ln'
     model.eval()
     test_loss = 0.0
     test_mae = 0.0
@@ -235,20 +326,31 @@ def train_model():
                 target = target.to(device).squeeze(1).long()
             else:
                 target = target.to(device)
+                target_raw = target
+                target = torch.log(target) if use_log_target else target
+                target = (target - target_mean) / target_std
 
             out = model(atom_fea, u_fea, edge_idx, crystal_atom_idx)
             loss = criterion(out, target)
             test_loss += loss.item() * len(target)
 
             if args.task == 'regression':
-                test_mae += torch.sum(torch.abs(out - target)).item()
+                pred_transformed = out * target_std + target_mean
+                pred_raw = (
+                    torch.exp(pred_transformed)
+                    if use_log_target else pred_transformed
+                )
+                test_mae += torch.sum(torch.abs(pred_raw - target_raw)).item()
             else:
                 test_correct += (out.argmax(dim=1) == target).sum().item()          #outが(B,2)の形状で、argmax(dim=1)で各サンプルで大きい方が予測クラスを取得する。targetは(B,)の形状で、各サンプルの正解クラスを保持している。比較結果はTrue/Falseのテンソルになるので、sum()で正解数をカウントする。
 
     test_loss /= test_size
     if args.task == 'regression':
         test_mae /= test_size
-        print(f"Test Loss (MSE): {test_loss:.4f} | Test MAE: {test_mae:.4f}")
+        print(
+            f"Test Loss (標準化MSE): {test_loss:.4f} | "
+            f"Test MAE (元の単位): {test_mae:.4f}"
+        )
     else:
         test_accuracy = test_correct / test_size
         print(
@@ -271,7 +373,7 @@ def test_gradient():
     target = torch.randn(2, 1)
 
     # 2. モデルと損失関数の準備
-    model = CGConvNet(D_v, D_u, D_v, tr =1)
+    model = CGConvNet(D_v, D_u, D_v, t_conv=1)
 
     criterion = nn.MSELoss()
 
